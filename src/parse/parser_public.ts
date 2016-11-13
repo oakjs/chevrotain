@@ -75,6 +75,8 @@ import {
     tokenStructuredIdentity,
     tokenStructuredMatcher
 } from "../scan/tokens"
+import {CstNode} from "./cst/cst_public"
+import {addNoneTerminalToCst, addTerminalToCst, buildChildrenDictionaryDefTopRules, initChildrenDictionary} from "./cst/cst"
 import ISerializedGast = gast.ISerializedGast
 import serializeGrammar = gast.serializeGrammar
 
@@ -89,8 +91,8 @@ export enum ParserDefinitionErrorType {
     AMBIGUOUS_ALTS
 }
 
-export type IgnoredRuleIssues = { [dslNameAndOccurrence:string]:boolean }
-export type IgnoredParserIssues = { [ruleName:string]:IgnoredRuleIssues }
+export type IgnoredRuleIssues = {[dslNameAndOccurrence:string]:boolean}
+export type IgnoredParserIssues = {[ruleName:string]:IgnoredRuleIssues}
 
 const IN_RULE_RECOVERY_EXCEPTION = "InRuleRecoveryException"
 const END_OF_FILE = new EOF();
@@ -157,13 +159,21 @@ export interface IParserConfig {
      * During Parser initialization.
      */
     dynamicTokensEnabled?:boolean
+
+    /**
+     * TODO: docs
+     */
+    outputCst?:boolean
 }
 
 const DEFAULT_PARSER_CONFIG:IParserConfig = Object.freeze({
     recoveryEnabled:      false,
     maxLookahead:         5,
     ignoredIssues:        <any>{},
-    dynamicTokensEnabled: false
+    dynamicTokensEnabled: false,
+    // TODO: Document this breaking change, can it be mitigated?
+    // TODO: change to true
+    outputCst:            false
 })
 
 export interface IRuleConfig<T> {
@@ -217,7 +227,6 @@ export interface IFollowKey {
     inRule:string
 }
 
-
 /**
  * OR([
  *  {ALT:XXX },
@@ -247,9 +256,12 @@ export interface IParserState {
     errors:exceptions.IRecognitionException[]
     lexerState:any
     RULE_STACK:string[]
+    CST_STACK:CstNode[]
 }
 
 export interface DSLMethodOpts<T> {
+    NAME?:string
+
     /**
      * The Grammar to process in this method.
      */
@@ -435,6 +447,11 @@ export class Parser {
                 let allFollows = computeAllProdsFollows(clonedProductions.values())
                 cache.setResyncFollowsForClass(className, allFollows)
             }
+
+            if (parserInstance.outputCst) {
+                let isCollectionForRules = buildChildrenDictionaryDefTopRules(clonedProductions.values())
+                cache.getIsCollectionPerRuleForClass(className).putAll(isCollectionForRules)
+            }
         }
 
         // reThrow the validation errors each time an erroneous parser is instantiated
@@ -454,6 +471,7 @@ export class Parser {
     protected dynamicTokensEnabled:boolean
     protected maxLookahead:number
     protected ignoredIssues:IgnoredParserIssues
+    protected outputCst:boolean
 
     protected _input:ISimpleTokenOrIToken[] = []
     protected inputIdx = -1
@@ -461,11 +479,14 @@ export class Parser {
     protected isBackTrackingStack = []
     protected className:string
     protected RULE_STACK:string[] = []
+    protected LAST_EXPLICIT_RULE_STACK:number[] = []
     protected RULE_OCCURRENCE_STACK:number[] = []
-    protected tokensMap:{ [fqn:string]:TokenConstructor } = undefined
+    protected CST_STACK:CstNode[] = []
+    protected tokensMap:{[fqn:string]:TokenConstructor} = undefined
 
     private firstAfterRepMap
     private classLAFuncs
+    private isCollectionForRule
     private definitionErrors:IParserDefinitionError[]
     private definedRulesNames:string[] = []
 
@@ -481,7 +502,7 @@ export class Parser {
      */
     private _productions:HashTable<gast.Rule> = new HashTable<gast.Rule>()
 
-    constructor(input:ISimpleTokenOrIToken[], tokensMapOrArr:{ [fqn:string]:TokenConstructor; } | TokenConstructor[],
+    constructor(input:ISimpleTokenOrIToken[], tokensMapOrArr:{[fqn:string]:TokenConstructor} | TokenConstructor[],
                 config:IParserConfig = DEFAULT_PARSER_CONFIG) {
         this._input = input
 
@@ -509,9 +530,19 @@ export class Parser {
             config.ignoredIssues :
             DEFAULT_PARSER_CONFIG.ignoredIssues
 
+        this.outputCst = has(config, "outputCst") ?
+            config.outputCst :
+            DEFAULT_PARSER_CONFIG.outputCst
+
+        if (!this.outputCst) {
+            this.updateCstStack = NOOP
+            this.popCstStack = NOOP
+        }
+
         this.className = classNameFromInstance(this)
         this.firstAfterRepMap = cache.getFirstAfterRepForClass(this.className)
         this.classLAFuncs = cache.getLookaheadFuncsForClass(this.className)
+        this.isCollectionForRule = cache.getIsCollectionPerRuleForClass(this.className)
 
         if (!cache.CLASS_TO_DEFINITION_ERRORS.containsKey(this.className)) {
             this.definitionErrors = []
@@ -590,6 +621,8 @@ export class Parser {
         this.errors = []
         this._input = []
         this.RULE_STACK = []
+        this.LAST_EXPLICIT_RULE_STACK = []
+        this.CST_STACK = []
         this.RULE_OCCURRENCE_STACK = []
     }
 
@@ -629,8 +662,8 @@ export class Parser {
         return !(isEmpty(this.isBackTrackingStack))
     }
 
-    protected getCurrRuleFullName() {
-        let shortName = last(this.RULE_STACK)
+    protected getCurrRuleFullName():string {
+        let shortName = this.getLastExplicitRuleShortName()
         return this.shortRuleNameToFull.get(shortName)
     }
 
@@ -638,8 +671,13 @@ export class Parser {
         return this.shortRuleNameToFull.get(shortName)
     }
 
-    protected getHumanReadableRuleStack() {
-        return map(this.RULE_STACK, (currShortName) => this.shortRuleNameToFullName(currShortName))
+    protected getHumanReadableRuleStack():string[] {
+        if (!isEmpty(this.LAST_EXPLICIT_RULE_STACK)) {
+            return map(this.LAST_EXPLICIT_RULE_STACK, (currIdx) => this.shortRuleNameToFullName(this.RULE_STACK[currIdx]))
+        }
+        else {
+            return map(this.RULE_STACK, (currShortName) => this.shortRuleNameToFullName(currShortName))
+        }
     }
 
     protected SAVE_ERROR(error:exceptions.IRecognitionException):exceptions.IRecognitionException {
@@ -771,7 +809,7 @@ export class Parser {
      * @see SUBRULE1
      */
     protected SUBRULE<T>(ruleToCall:(number) => T, args:any[] = []):T {
-        return this.SUBRULE1(ruleToCall, args)
+        return this.SUBRULE1.call(this, ruleToCall, args)
     }
 
     /**
@@ -793,35 +831,35 @@ export class Parser {
      * @returns {*} - The result of invoking ruleToCall.
      */
     protected SUBRULE1<T>(ruleToCall:(number) => T, args:any[] = []):T {
-        return ruleToCall.call(this, 1, args)
+        return this.subruleInternal(ruleToCall, 1, args)
     }
 
     /**
      * @see SUBRULE1
      */
     protected SUBRULE2<T>(ruleToCall:(number) => T, args:any[] = []):T {
-        return ruleToCall.call(this, 2, args)
+        return this.subruleInternal(ruleToCall, 2, args)
     }
 
     /**
      * @see SUBRULE1
      */
     protected SUBRULE3<T>(ruleToCall:(number) => T, args:any[] = []):T {
-        return ruleToCall.call(this, 3, args)
+        return this.subruleInternal(ruleToCall, 3, args)
     }
 
     /**
      * @see SUBRULE1
      */
     protected SUBRULE4<T>(ruleToCall:(number) => T, args:any[] = []):T {
-        return ruleToCall.call(this, 4, args)
+        return this.subruleInternal(ruleToCall, 4, args)
     }
 
     /**
      * @see SUBRULE1
      */
     protected SUBRULE5<T>(ruleToCall:(number) => T, args:any[] = []):T {
-        return ruleToCall.call(this, 5, args)
+        return this.subruleInternal(ruleToCall, 5, args)
     }
 
     /**
@@ -1237,7 +1275,9 @@ export class Parser {
      */
     protected RULE<T>(name:string,
                       implementation:(...implArgs:any[]) => T,
-                      config:IRuleConfig<T> = DEFAULT_RULE_CONFIG):(idxInCallingRule?:number, ...args:any[]) => T {
+                      // TODO: how to describe the optional return type of CSTNode? T|CstNode is not good because it is not backward
+                      // compatible, T|any is very general...
+                      config:IRuleConfig<T> = DEFAULT_RULE_CONFIG):(idxInCallingRule?:number, ...args:any[]) => T | any {
 
         let ruleErrors = validateRuleName(name, this.className)
         ruleErrors = ruleErrors.concat(validateRuleDoesNotAlreadyExist(name, this.definedRulesNames, this.className))
@@ -1299,17 +1339,44 @@ export class Parser {
     protected ruleInvocationStateUpdate(shortName:string, idxInCallingRule:number):void {
         this.RULE_OCCURRENCE_STACK.push(idxInCallingRule)
         this.RULE_STACK.push(shortName)
+        this.LAST_EXPLICIT_RULE_STACK.push(this.RULE_STACK.length - 1)
+
+        // TODO: optimize performance - pass fullName to to method instead of accessing via hashMap
+        let fullRuleName = this.shortRuleNameToFull.get(shortName)
+
+        // NOOP when cst is disabled
+        this.updateCstStack(fullRuleName)
     }
 
     protected ruleFinallyStateUpdate():void {
         this.RULE_STACK.pop()
         this.RULE_OCCURRENCE_STACK.pop()
+        this.LAST_EXPLICIT_RULE_STACK.pop()
+
+        // NOOP when cst is disabled
+        this.popCstStack()
 
         if ((this.RULE_STACK.length === 0) && !this.isAtEndOfInput()) {
             let firstRedundantTok = this.LA(1)
             this.SAVE_ERROR(new exceptions.NotAllInputParsedException(
                 "Redundant input, expecting EOF but found: " + getImage(firstRedundantTok), firstRedundantTok))
         }
+    }
+
+    protected implicitRuleInvocationStateUpdate(fullName:string):void {
+        this.RULE_OCCURRENCE_STACK.push(1)
+        this.RULE_STACK.push(fullName)
+
+        // NOOP when cst is disabled
+        this.updateCstStack(fullName)
+    }
+
+    protected implicitRuleFinallyStateUpdate():void {
+        this.RULE_STACK.pop()
+        this.RULE_OCCURRENCE_STACK.pop()
+
+        // NOOP when cst is disabled
+        this.popCstStack()
     }
 
     /**
@@ -1333,7 +1400,8 @@ export class Parser {
                 cacheData:   {
                     orgText:      "",
                     lineToOffset: []
-                }
+                },
+                tokenType:   tokClass.tokenType
             }
         }
         else if (Token.prototype.isPrototypeOf(tokClass.prototype)) {
@@ -1397,6 +1465,23 @@ export class Parser {
         return nextPossibleTokenTypes
     }
 
+    protected subruleInternal<T>(ruleToCall:(number) => T, idx, args:any[]) {
+        let ruleResult = ruleToCall.call(this, idx, args)
+
+        if (this.outputCst) {
+            // TODO: evaluate performance optimization #1: use shortnames in the first place
+            // TODO: evaluate performance optimization #2: keep last currRuleIsCollection in stackame
+            let shortName = last(this.RULE_STACK)
+            let fullRuleName = this.shortRuleNameToFull.get(shortName)
+            let currRuleIsCollection = this.isCollectionForRule.get(fullRuleName)
+            // TODO: constant
+            let currRuleName = (<any>ruleToCall).ruleName
+            addNoneTerminalToCst(last(this.CST_STACK), currRuleName, ruleResult, currRuleIsCollection.get(currRuleName))
+        }
+
+        return ruleResult
+    }
+
     /**
      * @param tokClass - The Type of Token we wish to consume (Reference to its constructor function).
      * @param idx - Occurrence index of consumed token in the invoking parser rule text
@@ -1412,11 +1497,22 @@ export class Parser {
     protected consumeInternal(tokClass:TokenConstructor, idx:number):ISimpleTokenOrIToken {
         // TODO: this is an hack to avoid try catch block in V8, should be removed once V8 supports try/catch optimizations.
         // as the IF/ELSE itself has some overhead.
-        if (!this.recoveryEnabled) {
+        if (!this.recoveryEnabled && !this.outputCst) {
             return this.consumeInternalOptimized(tokClass)
         }
         else {
-            return this.consumeInternalWithTryCatch(tokClass, idx)
+            let consumedToken = this.consumeInternalWithTryCatch(tokClass, idx)
+            if (this.outputCst) {
+                // TODO: evaluate performance optimization #1: use shortnames in the first place
+                // TODO: evaluate performance optimization #2: keep last currRuleIsCollection in stackame
+                // TODO: copy this logic to subrules
+                let shortName = this.getLastExplicitRuleShortName()
+                let fullRuleName = this.shortRuleNameToFull.get(shortName)
+                let currRuleIsCollection = this.isCollectionForRule.get(fullRuleName)
+                let currTokTypeName = tokenName(tokClass)
+                addTerminalToCst(last(this.CST_STACK), consumedToken, currRuleIsCollection.get(currTokTypeName))
+            }
+            return consumedToken
         }
     }
 
@@ -1500,10 +1596,12 @@ export class Parser {
         // errors is a getter which will clone the errors array
         let savedErrors = this.errors
         let savedRuleStack = cloneArr(this.RULE_STACK)
+        // TODO: add extra explict stack here
         return {
             errors:     savedErrors,
             lexerState: this.inputIdx,
-            RULE_STACK: savedRuleStack
+            RULE_STACK: savedRuleStack,
+            CST_STACK:  this.CST_STACK
         }
     }
 
@@ -1535,16 +1633,28 @@ export class Parser {
 
         function invokeRuleNoTry(args:any[]) {
             let result = impl.apply(this, args)
-            this.ruleFinallyStateUpdate()
-            return result
+
+            if (this.outputCst) {
+                let result = last(this.CST_STACK)
+                this.ruleFinallyStateUpdate()
+                return result
+            }
+            else {
+                this.ruleFinallyStateUpdate()
+                return result
+            }
         }
 
         function invokeRuleWithTry(args:any[], isFirstRule:boolean) {
             try {
-                // actual parsing happens here
-                return impl.apply(this, args)
+                if (this.outputCst) {
+                    impl.apply(this, args)
+                    return last(this.CST_STACK)
+                }
+                else {
+                    return impl.apply(this, args)
+                }
             } catch (e) {
-
                 // TODO: this is part of a Performance hack for V8 due to lack of support
                 // of try/catch optimizations. Should be removed once V8 supports that.
                 // This is needed because in case of an error during a nested subRule
@@ -1772,26 +1882,36 @@ export class Parser {
         if (this.RULE_STACK.length === 1) {
             return EOF_FOLLOW_KEY
         }
-        let currRuleIdx = this.RULE_STACK.length - 1
-        let currRuleOccIdx = currRuleIdx
-        let prevRuleIdx = currRuleIdx - 1
+
+        let currRuleShortName = this.getLastExplicitRuleShortName()
+        let prevRuleShortName = this.getPreviousExplicitRuleShortName()
+        let prevRuleIdx = this.getPreviousExplicitRuleOccurenceIndex()
 
         return {
-            ruleName:         this.shortRuleNameToFullName(this.RULE_STACK[currRuleIdx]),
-            idxInCallingRule: this.RULE_OCCURRENCE_STACK[currRuleOccIdx],
-            inRule:           this.shortRuleNameToFullName(this.RULE_STACK[prevRuleIdx])
+            ruleName:         this.shortRuleNameToFullName(currRuleShortName),
+            idxInCallingRule: prevRuleIdx,
+            inRule:           this.shortRuleNameToFullName(prevRuleShortName)
         }
     }
 
     private buildFullFollowKeyStack():IFollowKey[] {
-        return map(this.RULE_STACK, (ruleName, idx) => {
+        let explicitRuleStack = this.RULE_STACK
+        let explicitOccurrenceStack = this.RULE_OCCURRENCE_STACK
+
+        if (!isEmpty(this.LAST_EXPLICIT_RULE_STACK)) {
+            explicitRuleStack = map(this.LAST_EXPLICIT_RULE_STACK, (idx) => this.RULE_STACK[idx])
+            explicitOccurrenceStack = map(this.LAST_EXPLICIT_RULE_STACK, (idx) => this.RULE_OCCURRENCE_STACK[idx])
+        }
+
+        // TODO: only iterate over explicit rules here
+        return map(explicitRuleStack, (ruleName, idx) => {
             if (idx === 0) {
                 return EOF_FOLLOW_KEY
             }
             return {
                 ruleName:         this.shortRuleNameToFullName(ruleName),
-                idxInCallingRule: this.RULE_OCCURRENCE_STACK[idx],
-                inRule:           this.shortRuleNameToFullName(this.RULE_STACK[idx - 1])
+                idxInCallingRule: explicitOccurrenceStack[idx],
+                inRule:           this.shortRuleNameToFullName(explicitRuleStack[idx - 1])
             }
         })
     }
@@ -1871,32 +1991,62 @@ export class Parser {
         }
     }
 
+    private updateCstStack(fullRuleName:string):void {
+        this.CST_STACK.push({
+            name:               fullRuleName,
+            childrenDictionary: initChildrenDictionary(this.isCollectionForRule.get(fullRuleName)),
+        })
+    }
+
+    private popCstStack():void {
+        this.CST_STACK.pop()
+    }
+
     // Implementation of parsing DSL
     private optionInternal<OUT>(actionORMethodDef:GrammarAction<OUT> | DSLMethodOpts<OUT>, occurrence:number):OUT {
-        let lookAheadFunc = this.getLookaheadFuncForOption(occurrence)
 
-        let action
-        let predicate
-        if ((<DSLMethodOpts<OUT>>actionORMethodDef).DEF !== undefined) {
-            action = (<DSLMethodOpts<OUT>>actionORMethodDef).DEF
-            predicate = (<DSLMethodOpts<OUT>>actionORMethodDef).GATE
-            // predicate present
-            if (predicate !== undefined) {
-                let orgLookaheadFunction = lookAheadFunc
-                lookAheadFunc = () => {
-                    return predicate.call(this) &&
-                        orgLookaheadFunction.call(this)
+        let isExplictRule = (<DSLMethodOpts<OUT>>actionORMethodDef).NAME !== undefined
+        // TODO: measure performance impact of try/catch, consider
+        try {
+            if (isExplictRule) {
+                // TODO: but this uses the rulestack directly
+                let key = this.getKeyForAutomaticLookahead(OPTION_IDX, occurrence)
+                // TODO: build full name here
+                // TODO: how to differentiate between real and implicit rules? - or does it not matter?
+                // TODO: what is faster? cache it with the same key used in "getLookaheadFuncForOption" ? or concat strings?
+                this.implicitRuleInvocationStateUpdate((<DSLMethodOpts<OUT>>actionORMethodDef).NAME)
+            }
+
+            let lookAheadFunc = this.getLookaheadFuncForOption(occurrence)
+
+            let action
+            let predicate
+            if ((<DSLMethodOpts<OUT>>actionORMethodDef).DEF !== undefined) {
+                action = (<DSLMethodOpts<OUT>>actionORMethodDef).DEF
+                predicate = (<DSLMethodOpts<OUT>>actionORMethodDef).GATE
+                // predicate present
+                if (predicate !== undefined) {
+                    let orgLookaheadFunction = lookAheadFunc
+                    lookAheadFunc = () => {
+                        return predicate.call(this) &&
+                            orgLookaheadFunction.call(this)
+                    }
                 }
             }
-        }
-        else {
-            action = actionORMethodDef
-        }
+            else {
+                action = actionORMethodDef
+            }
 
-        if ((lookAheadFunc).call(this)) {
-            return action.call(this)
+            if ((lookAheadFunc).call(this)) {
+                return action.call(this)
+            }
+            return undefined
         }
-        return undefined
+        finally {
+            if (isExplictRule === true) {
+                this.implicitRuleFinallyStateUpdate()
+            }
+        }
     }
 
     private atLeastOneInternal<OUT>(prodOccurrence:number,
@@ -2108,6 +2258,7 @@ export class Parser {
         let nextToken = this.LA(1)
         if (this.tokenMatcher(nextToken, expectedTokClass)) {
             this.consumeToken()
+            // TODO: add to CST here
             return nextToken
         }
         else {
@@ -2118,8 +2269,7 @@ export class Parser {
 
     // this actually returns a number, but it is always used as a string (object prop key)
     private getKeyForAutomaticLookahead(dslMethodIdx:number, occurrence:number):number {
-        let ruleStack = this.RULE_STACK
-        let currRuleShortName:any = ruleStack[ruleStack.length - 1]
+        let currRuleShortName:any = this.getLastExplicitRuleShortName()
         /* tslint:disable */
         return occurrence | dslMethodIdx | currRuleShortName
         /* tslint:enable */
@@ -2241,6 +2391,22 @@ export class Parser {
         }
         throw this.SAVE_ERROR(new exceptions.EarlyExitException(userDefinedErrMsg + errSuffix, this.LA(1)))
     }
+
+    private getLastExplicitRuleShortName():string {
+        let lastExplictIndex = this.LAST_EXPLICIT_RULE_STACK[this.LAST_EXPLICIT_RULE_STACK.length - 1]
+        return this.RULE_STACK[lastExplictIndex]
+    }
+
+    private getPreviousExplicitRuleShortName():string {
+        let lastExplicitIndex = this.LAST_EXPLICIT_RULE_STACK[this.LAST_EXPLICIT_RULE_STACK.length - 2]
+        return this.RULE_STACK[lastExplicitIndex]
+    }
+
+    private getPreviousExplicitRuleOccurenceIndex():number {
+        let lastExplicitIndex = this.LAST_EXPLICIT_RULE_STACK[this.LAST_EXPLICIT_RULE_STACK.length - 2]
+        return this.RULE_OCCURRENCE_STACK[lastExplicitIndex]
+    }
+
 }
 
 function InRuleRecoveryException(message:string) {
